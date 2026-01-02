@@ -1,125 +1,146 @@
 import tkinter as tk
-import time
 import threading
-import os
+import sys
+import posix_ipc
+import time
 
-LOG_FILE = "ipc_log.txt"
-HIGHLIGHT_DURATION_MS = int(os.environ.get("HIGHLIGHT_DURATION_MS", "1000"))
+MQ_A_TO_B = "/mq_a_to_b"
+MQ_B_TO_A = "/mq_b_to_a"
+HIGHLIGHT_DURATION_MS = 700
+
+
+def get_queue(name):
+    try:
+        return posix_ipc.MessageQueue(name)
+    except posix_ipc.ExistentialError:
+        return posix_ipc.MessageQueue(
+            name,
+            flags=posix_ipc.O_CREAT,
+            max_messages=10,
+            max_message_size=1024
+        )
+
 
 class IPCVisualizer:
-    def __init__(self, root):
+    def __init__(self, root, role):
         self.root = root
-        root.title("Full-Duplex IPC Visualizer")
+        self.role = role
+        root.title(f"IPC Full-Duplex Chat — Process {role}")
 
-        self.canvas = tk.Canvas(root, width=700, height=300, bg="white")
-        self.canvas.pack()
+        # ================= Canvas =================
+        self.canvas = tk.Canvas(root, width=700, height=260, bg="white")
+        self.canvas.pack(pady=5)
 
-        # Draw process boxes
-        self.procA = self.canvas.create_rectangle(50, 100, 200, 180, fill="#e3f2fd")
-        self.procB = self.canvas.create_rectangle(500, 100, 650, 180, fill="#e8f5e9")
+        self.canvas.create_rectangle(50, 90, 200, 160, fill="#e3f2fd")
+        self.canvas.create_rectangle(500, 90, 650, 160, fill="#e8f5e9")
 
-        self.canvas.create_text(125, 140, text="Process A", font=("Arial", 12, "bold"))
-        self.canvas.create_text(575, 140, text="Process B", font=("Arial", 12, "bold"))
+        self.canvas.create_text(125, 125, text="Process A", font=("Arial", 12, "bold"))
+        self.canvas.create_text(575, 125, text="Process B", font=("Arial", 12, "bold"))
 
-        # Arrows
-        self.arrow_ab = self.canvas.create_line(200, 140, 500, 140,
-                                                arrow=tk.LAST, width=3, fill="gray")
-        self.arrow_ba = self.canvas.create_line(500, 160, 200, 160,
-                                                arrow=tk.LAST, width=3, fill="gray")
+        self.arrow_ab = self.canvas.create_line(
+            200, 115, 500, 115, arrow=tk.LAST, width=3, fill="gray"
+        )
+        self.arrow_ba = self.canvas.create_line(
+            500, 135, 200, 135, arrow=tk.LAST, width=3, fill="gray"
+        )
 
-        self.status = tk.Label(root, text="Waiting for IPC events...", font=("Arial", 11))
-        self.status.pack(pady=10)
+        # ================= Chat =================
+        self.log = tk.Text(root, height=10, width=90, state=tk.DISABLED)
+        self.log.pack(padx=10, pady=5)
 
-        # Message area: show recent [SEND] and [RECV] messages
-        self.log_frame = tk.Frame(root)
-        self.log_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0,10))
+        self.log.tag_config(
+            "incoming", justify="left",
+            lmargin1=10, lmargin2=10, rmargin=120
+        )
+        self.log.tag_config(
+            "outgoing", justify="right",
+            lmargin1=120, lmargin2=120, rmargin=10,
+            foreground="#0b8043"
+        )
 
-        self.log_text = tk.Text(self.log_frame, height=6, width=88, state=tk.DISABLED, wrap=tk.NONE)
-        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        scrollbar = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.config(yscrollcommand=scrollbar.set)
+        # ================= Input =================
+        frame = tk.Frame(root)
+        frame.pack(pady=5)
 
-        # Tags for coloring
-        self.log_text.tag_config('send', foreground='green')
-        self.log_text.tag_config('recv', foreground='orange')
-        self.log_text.tag_config('info', foreground='black')
+        self.entry = tk.Entry(frame, width=70)
+        self.entry.pack(side=tk.LEFT, padx=5)
+        self.entry.bind("<Return>", lambda e: self.send_message())
 
-        # Track scheduled after callbacks so we can cancel/reset them and ensure
-        # only one arrow is highlighted at a time.
-        self._after_ids = {}
+        tk.Button(frame, text="Send", command=self.send_message).pack(side=tk.LEFT)
 
-        self.last_size = 0
-        threading.Thread(target=self.watch_log, daemon=True).start()
+        # ================= Message Queues =================
+        self.mq_a2b = get_queue(MQ_A_TO_B)
+        self.mq_b2a = get_queue(MQ_B_TO_A)
 
-    def flash_arrow(self, arrow, color):
-        # Ensure any pending resets are cancelled and clear both arrows first
-        for a in (self.arrow_ab, self.arrow_ba):
-            after_id = self._after_ids.pop(a, None)
-            if after_id:
-                try:
-                    self.root.after_cancel(after_id)
-                except Exception:
-                    pass
-            # reset other arrow immediately
-            self.canvas.itemconfig(a, fill="gray")
+        if role == "A":
+            self.send_mq = self.mq_a2b
+            self.recv_mq = self.mq_b2a
+            self.peer = "B"
+        else:
+            self.send_mq = self.mq_b2a
+            self.recv_mq = self.mq_a2b
+            self.peer = "A"
 
-        # Highlight the requested arrow and schedule a reset
-        self.canvas.itemconfig(arrow, fill=color)
-        after_id = self.root.after(HIGHLIGHT_DURATION_MS, lambda a=arrow: self._reset_arrow(a))
-        self._after_ids[arrow] = after_id
+        # ================= Receiver Thread =================
+        threading.Thread(target=self.receive_loop, daemon=True).start()
 
-    def _reset_arrow(self, arrow):
-        # Callback to reset an arrow and clear its after id
-        try:
-            self.canvas.itemconfig(arrow, fill="gray")
-        except Exception:
-            pass
-        self._after_ids.pop(arrow, None)
+    # ==================================================
+    def send_message(self):
+        msg = self.entry.get().strip()
+        if not msg:
+            return
 
-    def watch_log(self):
+        self.send_mq.send(msg.encode())
+        self.entry.delete(0, tk.END)
+
+        self.append(f"You: {msg}", "outgoing")
+
+        if self.role == "A":
+            self.flash(self.arrow_ab, "green")
+        else:
+            self.flash(self.arrow_ba, "blue")
+
+    # ==================================================
+    def receive_loop(self):
         while True:
-            if os.path.exists(LOG_FILE):
-                size = os.path.getsize(LOG_FILE)
-                if size > self.last_size:
-                    with open(LOG_FILE, "r") as f:
-                        f.seek(self.last_size)
-                        lines = f.readlines()
-                        self.last_size = size
-                        for line in lines:
-                            self.process_event(line.strip())
-            time.sleep(0.2)
+            msg, _ = self.recv_mq.receive()  # blocking is OK in thread
+            text = msg.decode()
 
-    def process_event(self, event):
-        # Update status text
-        self.root.after(0, lambda: self.status.config(text=event))
+            self.root.after(
+                0,
+                lambda t=text:
+                self.append(f"{self.peer}: {t}", "incoming")
+            )
 
-        # Determine message type and direction
-        tag = 'info'
-        if "[SEND]" in event:
-            tag = 'send'
-            if "A->B" in event:
-                self.root.after(0, lambda: self.flash_arrow(self.arrow_ab, "green"))
-            elif "B->A" in event:
-                self.root.after(0, lambda: self.flash_arrow(self.arrow_ba, "blue"))
-        elif "[RECV]" in event:
-            tag = 'recv'
-            # Highlight arrow for a recv as well (subtle color)
-            if "A->B" in event or "A<-B" in event:
-                self.root.after(0, lambda: self.flash_arrow(self.arrow_ba, "orange"))
-            elif "B->A" in event or "B<-A" in event:
-                self.root.after(0, lambda: self.flash_arrow(self.arrow_ab, "orange"))
+            if self.role == "A":
+                self.root.after(0, lambda: self.flash(self.arrow_ba, "blue"))
+            else:
+                self.root.after(0, lambda: self.flash(self.arrow_ab, "green"))
 
-        # Append to message area
-        self.root.after(0, lambda: self.append_message(event, tag))
+    # ==================================================
+    def flash(self, arrow, color):
+        self.canvas.itemconfig(self.arrow_ab, fill="gray")
+        self.canvas.itemconfig(self.arrow_ba, fill="gray")
+        self.canvas.itemconfig(arrow, fill=color)
+        self.root.after(
+            HIGHLIGHT_DURATION_MS,
+            lambda: self.canvas.itemconfig(arrow, fill="gray")
+        )
 
-    def append_message(self, text, tag='info'):
-        # Insert a line into the read-only Text widget with the given tag
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, text + "\n", tag)
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
+    # ==================================================
+    def append(self, text, tag):
+        self.log.config(state=tk.NORMAL)
+        self.log.insert(tk.END, text + "\n\n", tag)
+        self.log.see(tk.END)
+        self.log.config(state=tk.DISABLED)
 
-root = tk.Tk()
-app = IPCVisualizer(root)
-root.mainloop()
+
+# ======================= MAIN =========================
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or sys.argv[1] not in ("A", "B"):
+        print("Usage: python3 visualiser.py <A|B>")
+        sys.exit(1)
+
+    root = tk.Tk()
+    IPCVisualizer(root, sys.argv[1])
+    root.mainloop()
