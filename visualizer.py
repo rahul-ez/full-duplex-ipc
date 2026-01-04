@@ -2,145 +2,107 @@ import tkinter as tk
 import threading
 import sys
 import posix_ipc
-import time
 
-MQ_A_TO_B = "/mq_a_to_b"
-MQ_B_TO_A = "/mq_b_to_a"
 HIGHLIGHT_DURATION_MS = 700
 
-
-def get_queue(name):
-    try:
-        return posix_ipc.MessageQueue(name)
-    except posix_ipc.ExistentialError:
-        return posix_ipc.MessageQueue(
-            name,
-            flags=posix_ipc.O_CREAT,
-            max_messages=10,
-            max_message_size=1024
-        )
-
-
 class IPCVisualizer:
-    def __init__(self, root, role):
+    def __init__(self, root, self_name, peer_name):
         self.root = root
-        self.role = role
-        root.title(f"IPC Full-Duplex Chat — Process {role}")
+        self.self_name = self_name
+        self.peer_name = peer_name
+        root.title(f"Visualizer — {self_name}")
 
-        # ================= Canvas =================
-        self.canvas = tk.Canvas(root, width=700, height=260, bg="white")
+        self.sent_count = 0
+        self.recv_count = 0
+
+        # --- UI SETUP ---
+        self.canvas = tk.Canvas(root, width=700, height=180, bg="white")
         self.canvas.pack(pady=5)
+        
+        # Entities & Arrows
+        self.canvas.create_rectangle(50, 60, 200, 120, fill="#e3f2fd", outline="#1976d2")
+        self.canvas.create_rectangle(500, 60, 650, 120, fill="#e8f5e9", outline="#388e3c")
+        self.canvas.create_text(125, 90, text=self_name, font=("Arial", 10, "bold"))
+        self.canvas.create_text(575, 90, text=peer_name, font=("Arial", 10, "bold"))
+        self.arrow_out = self.canvas.create_line(200, 80, 500, 80, arrow=tk.LAST, width=3, fill="gray")
+        self.arrow_in = self.canvas.create_line(500, 100, 200, 100, arrow=tk.LAST, width=3, fill="gray")
 
-        self.canvas.create_rectangle(50, 90, 200, 160, fill="#e3f2fd")
-        self.canvas.create_rectangle(500, 90, 650, 160, fill="#e8f5e9")
-
-        self.canvas.create_text(125, 125, text="Process A", font=("Arial", 12, "bold"))
-        self.canvas.create_text(575, 125, text="Process B", font=("Arial", 12, "bold"))
-
-        self.arrow_ab = self.canvas.create_line(
-            200, 115, 500, 115, arrow=tk.LAST, width=3, fill="gray"
-        )
-        self.arrow_ba = self.canvas.create_line(
-            500, 135, 200, 135, arrow=tk.LAST, width=3, fill="gray"
-        )
-
-        # ================= Chat =================
-        self.log = tk.Text(root, height=10, width=90, state=tk.DISABLED)
-        self.log.pack(padx=10, pady=5)
-
-        self.log.tag_config(
-            "incoming", justify="left",
-            lmargin1=10, lmargin2=10, rmargin=120
-        )
-        self.log.tag_config(
-            "outgoing", justify="right",
-            lmargin1=120, lmargin2=120, rmargin=10,
-            foreground="#0b8043"
-        )
-
-        # ================= Input =================
-        frame = tk.Frame(root)
-        frame.pack(pady=5)
-
-        self.entry = tk.Entry(frame, width=70)
+        # Center Input Bar
+        input_frame = tk.Frame(root)
+        input_frame.pack(pady=10, fill=tk.X)
+        
+        # Internal frame to center elements
+        center_container = tk.Frame(input_frame)
+        center_container.pack(expand=True)
+        
+        self.entry = tk.Entry(center_container, width=50)
         self.entry.pack(side=tk.LEFT, padx=5)
         self.entry.bind("<Return>", lambda e: self.send_message())
+        
+        send_btn = tk.Button(center_container, text="Send", command=self.send_message, bg="#e0e0e0")
+        send_btn.pack(side=tk.LEFT)
 
-        tk.Button(frame, text="Send", command=self.send_message).pack(side=tk.LEFT)
+        # Stats
+        self.stats_label = tk.Label(root, text="Sent: 0 | Received: 0", font=("Arial", 9, "italic"), fg="gray")
+        self.stats_label.pack()
 
-        # ================= Message Queues =================
-        self.mq_a2b = get_queue(MQ_A_TO_B)
-        self.mq_b2a = get_queue(MQ_B_TO_A)
+        # Chat Log with Alignment Tags
+        self.log = tk.Text(root, height=12, width=80, state=tk.DISABLED, padx=10, pady=10)
+        self.log.pack(padx=20, pady=10)
+        
+        # Tag configuration: "sent" aligns right, "received" aligns left
+        self.log.tag_config("sent", justify='right', foreground="#0b8043")
+        self.log.tag_config("received", justify='left', foreground="#1976d2")
 
-        if role == "A":
-            self.send_mq = self.mq_a2b
-            self.recv_mq = self.mq_b2a
-            self.peer = "B"
-        else:
-            self.send_mq = self.mq_b2a
-            self.recv_mq = self.mq_a2b
-            self.peer = "A"
+        # Connect to Local C Backend
+        try:
+            self.mq_to_c = posix_ipc.MessageQueue(f"/mq_gui_tx_{self_name}")
+            self.mq_from_c = posix_ipc.MessageQueue(f"/mq_gui_rx_{self_name}")
+        except Exception as e:
+            print(f"Error: Connect to C backend first.\n{e}")
+            sys.exit(1)
 
-        # ================= Receiver Thread =================
         threading.Thread(target=self.receive_loop, daemon=True).start()
 
-    # ==================================================
+    def update_stats_label(self):
+        self.stats_label.config(text=f"Sent: {self.sent_count} | Received: {self.recv_count}")
+
     def send_message(self):
         msg = self.entry.get().strip()
-        if not msg:
-            return
+        if msg:
+            self.mq_to_c.send(msg.encode())
+            self.entry.delete(0, tk.END)
 
-        self.send_mq.send(msg.encode())
-        self.entry.delete(0, tk.END)
-
-        self.append(f"You: {msg}", "outgoing")
-
-        if self.role == "A":
-            self.flash(self.arrow_ab, "green")
-        else:
-            self.flash(self.arrow_ba, "blue")
-
-    # ==================================================
     def receive_loop(self):
         while True:
-            msg, _ = self.recv_mq.receive()  # blocking is OK in thread
-            text = msg.decode()
+            try:
+                msg, _ = self.mq_from_c.receive()
+                text = msg.decode('utf-8').strip('\x00')
+                
+                if text.startswith(f"[{self.self_name}]"):
+                    self.sent_count += 1
+                    # Pass the "sent" tag
+                    self.root.after(0, lambda t=text: self.display(t, "#0b8043", self.arrow_out, "sent"))
+                else:
+                    self.recv_count += 1
+                    # Pass the "received" tag
+                    self.root.after(0, lambda t=text: self.display(t, "blue", self.arrow_in, "received"))
+                
+                self.root.after(0, self.update_stats_label)
+            except:
+                break
 
-            self.root.after(
-                0,
-                lambda t=text:
-                self.append(f"{self.peer}: {t}", "incoming")
-            )
-
-            if self.role == "A":
-                self.root.after(0, lambda: self.flash(self.arrow_ba, "blue"))
-            else:
-                self.root.after(0, lambda: self.flash(self.arrow_ab, "green"))
-
-    # ==================================================
-    def flash(self, arrow, color):
-        self.canvas.itemconfig(self.arrow_ab, fill="gray")
-        self.canvas.itemconfig(self.arrow_ba, fill="gray")
-        self.canvas.itemconfig(arrow, fill=color)
-        self.root.after(
-            HIGHLIGHT_DURATION_MS,
-            lambda: self.canvas.itemconfig(arrow, fill="gray")
-        )
-
-    # ==================================================
-    def append(self, text, tag):
+    def display(self, text, color, arrow, tag):
         self.log.config(state=tk.NORMAL)
-        self.log.insert(tk.END, text + "\n\n", tag)
+        # Apply the alignment tag here
+        self.log.insert(tk.END, text + "\n", tag)
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
+        
+        self.canvas.itemconfig(arrow, fill=color)
+        self.root.after(HIGHLIGHT_DURATION_MS, lambda: self.canvas.itemconfig(arrow, fill="gray"))
 
-
-# ======================= MAIN =========================
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in ("A", "B"):
-        print("Usage: python3 visualiser.py <A|B>")
-        sys.exit(1)
-
     root = tk.Tk()
-    IPCVisualizer(root, sys.argv[1])
+    app = IPCVisualizer(root, sys.argv[1], sys.argv[2])
     root.mainloop()
