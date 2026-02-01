@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 venv/
+
+# C
+*.o
+chat
+
+# Logs and Data
+strace_*.out
+ipc_log.txt
+ipc_history.log

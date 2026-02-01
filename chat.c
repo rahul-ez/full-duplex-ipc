@@ -95,6 +95,7 @@ void *gui_relay_thread(void *arg) {
     while (keep_running) {
         ssize_t n = mq_receive(gui_rx_mq, buffer, MAX_TEXT, NULL);
         if (n < 0) continue;
+        if (n < MAX_TEXT) buffer[n] = '\0';
 
         char out_buf[MAX_TEXT];
         snprintf(out_buf, MAX_TEXT, "[%s]: %s", self, buffer);
